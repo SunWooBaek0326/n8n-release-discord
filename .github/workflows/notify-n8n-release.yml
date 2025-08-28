@@ -1,0 +1,84 @@
+name: Notify n8n Releases to Discord
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # 30분마다(UTC 기준). KST는 +9시간
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write   # 리포지토리 변수 저장에 필요
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Fetch latest n8n release info
+        id: latest
+        run: |
+          LATEST_JSON=$(curl -s https://api.github.com/repos/n8n-io/n8n/releases/latest)
+          TAG=$(echo "$LATEST_JSON" | jq -r .tag_name)
+          NAME=$(echo "$LATEST_JSON" | jq -r .name)
+          URL=$(echo "$LATEST_JSON" | jq -r .html_url)
+          BODY=$(echo "$LATEST_JSON" | jq -r .body | head -c 1800 | sed 's/"/\\"/g')
+
+          echo "tag=$TAG"   >> $GITHUB_OUTPUT
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+          echo "url=$URL"   >> $GITHUB_OUTPUT
+          echo "body=$BODY" >> $GITHUB_OUTPUT
+
+      - name: Read repository variable LAST_N8N_TAG (if exists)
+        id: readvar
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables/LAST_N8N_TAG"
+          STATUS=$(curl -s -o /tmp/var.json -w "%{http_code}" -H "Authorization: Bearer $GH_TOKEN" "$API")
+          if [ "$STATUS" = "200" ]; then
+            LAST=$(jq -r .value /tmp/var.json)
+          else
+            LAST=""
+          fi
+          echo "last=$LAST" >> $GITHUB_OUTPUT
+
+      - name: Skip if already notified
+        if: steps.latest.outputs.tag == steps.readvar.outputs.last
+        run: echo "Already notified for ${ { steps.latest.outputs.tag } }"
+
+      - name: Send Discord notification
+        if: steps.latest.outputs.tag != steps.readvar.outputs.last
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          JSON=$(cat <<EOF
+          {
+            "username": "n8n Release Bot",
+            "embeds": [{
+              "title": "n8n ${ { steps.latest.outputs.tag } } released",
+              "url": "${ { steps.latest.outputs.url } }",
+              "description": "${ { steps.latest.outputs.body } }"
+            }]
+          }
+          EOF
+          )
+          curl -s -H "Content-Type: application/json" -X POST -d "$JSON" "$DISCORD_WEBHOOK"
+
+      - name: Save LAST_N8N_TAG variable
+        if: steps.latest.outputs.tag != steps.readvar.outputs.last
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables/LAST_N8N_TAG"
+          DATA=$(jq -n --arg v "${{ steps.latest.outputs.tag }}" '{name:"LAST_N8N_TAG", value:$v}')
+          # 변수 존재 여부 확인
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $GH_TOKEN" "$API")
+          if [ "$STATUS" = "200" ]; then
+            curl -s -X PATCH -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" -d "$DATA" "$API" > /dev/null
+          else
+            curl -s -X POST  -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" -d "$DATA" "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables" > /dev/null
+          fi
