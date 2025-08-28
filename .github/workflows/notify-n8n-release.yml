@@ -2,83 +2,66 @@ name: Notify n8n Releases to Discord
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # 30분마다(UTC 기준). KST는 +9시간
-  workflow_dispatch:
+    - cron: "*/30 * * * *"   # 30분마다(UTC). 실제 실행은 지연될 수 있음
+  workflow_dispatch:          # 수동 실행(테스트용)
 
 permissions:
   contents: read
-  actions: write   # 리포지토리 변수 저장에 필요
 
 jobs:
   notify:
     runs-on: ubuntu-latest
+
     steps:
       - name: Install jq
         run: |
           sudo apt-get update
           sudo apt-get install -y jq
 
-      - name: Fetch latest n8n release info
-        id: latest
-        run: |
-          LATEST_JSON=$(curl -s https://api.github.com/repos/n8n-io/n8n/releases/latest)
-          TAG=$(echo "$LATEST_JSON" | jq -r .tag_name)
-          NAME=$(echo "$LATEST_JSON" | jq -r .name)
-          URL=$(echo "$LATEST_JSON" | jq -r .html_url)
-          BODY=$(echo "$LATEST_JSON" | jq -r .body | head -c 1800 | sed 's/"/\\"/g')
-
-          echo "tag=$TAG"   >> $GITHUB_OUTPUT
-          echo "name=$NAME" >> $GITHUB_OUTPUT
-          echo "url=$URL"   >> $GITHUB_OUTPUT
-          echo "body=$BODY" >> $GITHUB_OUTPUT
-
-      - name: Read repository variable LAST_N8N_TAG (if exists)
-        id: readvar
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          API="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables/LAST_N8N_TAG"
-          STATUS=$(curl -s -o /tmp/var.json -w "%{http_code}" -H "Authorization: Bearer $GH_TOKEN" "$API")
-          if [ "$STATUS" = "200" ]; then
-            LAST=$(jq -r .value /tmp/var.json)
-          else
-            LAST=""
-          fi
-          echo "last=$LAST" >> $GITHUB_OUTPUT
-
-      - name: Skip if already notified
-        if: steps.latest.outputs.tag == steps.readvar.outputs.last
-        run: echo "Already notified for ${ { steps.latest.outputs.tag } }"
-
-      - name: Send Discord notification
-        if: steps.latest.outputs.tag != steps.readvar.outputs.last
+      # --- 수동 실행 시, 즉시 웹훅 연결 테스트(시크릿/권한/네트워크 점검) ---
+      - name: Send TEST ping on manual run
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
-          JSON=$(cat <<EOF
-          {
-            "username": "n8n Release Bot",
-            "embeds": [{
-              "title": "n8n ${ { steps.latest.outputs.tag } } released",
-              "url": "${ { steps.latest.outputs.url } }",
-              "description": "${ { steps.latest.outputs.body } }"
-            }]
-          }
-          EOF
-          )
-          curl -s -H "Content-Type: application/json" -X POST -d "$JSON" "$DISCORD_WEBHOOK"
+          jq -n --arg c "✅ GitHub Actions ↔ Discord Webhook 테스트 성공 (manual run)" '{content:$c}' \
+          | curl -s -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK"
 
-      - name: Save LAST_N8N_TAG variable
-        if: steps.latest.outputs.tag != steps.readvar.outputs.last
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # --- n8n 최신 정식 릴리스 조회 ---
+      - name: Fetch latest n8n release
+        id: latest
         run: |
-          API="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables/LAST_N8N_TAG"
-          DATA=$(jq -n --arg v "${{ steps.latest.outputs.tag }}" '{name:"LAST_N8N_TAG", value:$v}')
-          # 변수 존재 여부 확인
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $GH_TOKEN" "$API")
-          if [ "$STATUS" = "200" ]; then
-            curl -s -X PATCH -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" -d "$DATA" "$API" > /dev/null
-          else
-            curl -s -X POST  -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" -d "$DATA" "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables" > /dev/null
-          fi
+          curl -s https://api.github.com/repos/n8n-io/n8n/releases/latest > latest.json
+          echo "tag=$(jq -r .tag_name latest.json)" >> $GITHUB_OUTPUT
+          echo "url=$(jq -r .html_url latest.json)" >> $GITHUB_OUTPUT
+          # 본문 1,800자 제한 + 안전한 JSON 인코딩 준비
+          body=$(jq -r .body latest.json | head -c 1800)
+          printf '%s' "$body" | jq -Rs '.' > body.json
+
+      # --- 같은 태그는 한 번만 전송하도록 캐시로 중복 방지 ---
+      - name: Cache by release tag
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/n8n/${{ steps.latest.outputs.tag }}
+          key: n8n-${{ steps.latest.outputs.tag }}
+
+      # --- 새 태그일 때만 디스코드 알림 전송 ---
+      - name: Send Discord notification (new tag only)
+        if: ${{ steps.cache.outputs.cache-hit != 'true' }}
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          title="n8n ${{ steps.latest.outputs.tag }} released"
+          url="${{ steps.latest.outputs.url }}"
+          desc=$(cat body.json)  # 이미 JSON 문자열로 인코딩됨
+
+          jq -n \
+            --arg t "$title" \
+            --arg u "$url" \
+            --argjson d "$desc" \
+            '{username:"n8n Release Bot", embeds:[{title:$t, url:$u, description:$d}]}' \
+          | curl -s -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK"
+
+          # 캐시 시드(같은 태그 재전송 방지)
+          mkdir -p ".cache/n8n/${{ steps.latest.outputs.tag }}"
