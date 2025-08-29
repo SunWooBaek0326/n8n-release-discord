@@ -2,11 +2,11 @@ name: Notify n8n Releases to Discord
 
 on:
   schedule:
-    - cron: "*/30 * * * *"     # 30분마다 자동 실행(UTC)
-  workflow_dispatch: {}        # ✅ 수동 실행 버튼
+    - cron: "*/30 * * * *"     # 30분마다 자동 실행 (UTC)
+  workflow_dispatch: {}        # 수동 실행 버튼
 
 permissions:
-  contents: write              # 버전 기록 파일 커밋용
+  contents: write              # .github/n8n_latest 커밋용
 
 jobs:
   notify:
@@ -21,81 +21,92 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq
 
+      # ── 시크릿 값 검증
+      - name: Validate webhook secret
+        run: |
+          if [ -z "${{ secrets.DISCORD_WEBHOOK_URL }}" ]; then
+            echo "::error::Missing secret DISCORD_WEBHOOK_URL"
+            exit 1
+          fi
+
+      # ── 시크릿 정규화 (줄바꿈/공백 제거)
+      - name: Normalize webhook value
+        id: hook
+        run: |
+          CLEAN=$(printf "%s" "${{ secrets.DISCORD_WEBHOOK_URL }}" \
+                  | tr -d '\r' | tr -d '\n' | xargs)
+          case "$CLEAN" in
+            https://discord.com/api/webhooks/*|https://discordapp.com/api/webhooks/*) : ;;
+            *) echo "::error::Webhook URL looks invalid: $CLEAN"; exit 2 ;;
+          esac
+          echo "webhook=$CLEAN" >> $GITHUB_OUTPUT
+
+      # ── 최신 n8n 릴리스 정보 가져오기
       - name: Fetch latest n8n release
         id: latest
         run: |
           RES=$(curl -s https://api.github.com/repos/n8n-io/n8n/releases/latest)
-          TAG=$(echo "$RES"  | jq -r .tag_name)         # ex) 1.108.2
+          TAG=$(echo "$RES"  | jq -r .tag_name)
           DATE=$(echo "$RES" | jq -r .published_at | cut -dT -f1)
           URL=$(echo "$RES"  | jq -r .html_url)
           echo "tag=$TAG"   >> $GITHUB_OUTPUT
           echo "date=$DATE" >> $GITHUB_OUTPUT
           echo "url=$URL"   >> $GITHUB_OUTPUT
 
+      # ── 이전 버전 기록 확인
       - name: Read previous tag from repo
         id: prev
         run: |
           FILE=".github/n8n_latest"
-          if [ -f "$FILE" ]; then
-            PREV=$(cat "$FILE")
-          else
-            PREV=""
-          fi
+          if [ -f "$FILE" ]; then PREV=$(cat "$FILE"); else PREV=""; fi
           echo "prev=$PREV" >> $GITHUB_OUTPUT
 
+      # ── 실행 모드 결정 (자동/수동, 변경 여부)
       - name: Decide message mode
         id: decide
         env:
-          EVENT: ${{ github.event_name }}     # schedule | workflow_dispatch
+          EVENT: ${{ github.event_name }}
           PREV:  ${{ steps.prev.outputs.prev }}
           CURR:  ${{ steps.latest.outputs.tag }}
         run: |
           CHANGED="false"
           if [ "$PREV" != "$CURR" ]; then CHANGED="true"; fi
-
-          if [ "$EVENT" = "workflow_dispatch" ]; then
-            MODE="manual"         # 수동 실행
-          else
-            MODE="auto"           # 자동 실행
-          fi
-
+          MODE="auto"
+          if [ "$EVENT" = "workflow_dispatch" ]; then MODE="manual"; fi
           echo "changed=$CHANGED" >> $GITHUB_OUTPUT
           echo "mode=$MODE"       >> $GITHUB_OUTPUT
 
+      # ── Discord로 전송
       - name: Send to Discord
         if: always()
         env:
-          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          WEBHOOK: ${{ steps.hook.outputs.webhook }}
           TAG:  ${{ steps.latest.outputs.tag }}
           DATE: ${{ steps.latest.outputs.date }}
           URL:  ${{ steps.latest.outputs.url }}
           MODE: ${{ steps.decide.outputs.mode }}
           CHG:  ${{ steps.decide.outputs.changed }}
         run: |
+          set -e
           send_embed() {
-            curl -s -H "Content-Type: application/json" \
-              -d "$(jq -n \
-                  --arg title "n8n @$TAG released" \
-                  --arg desc  "$DATE" \
-                  --arg url   "$URL" \
-                  '{embeds:[{title:$title, description:$desc, url:$url}]}')" \
-              "$WEBHOOK" > /dev/null
+            curl -sS -H "Content-Type: application/json" \
+              -d "$(jq -n --arg title "n8n @$TAG released" --arg desc "$DATE" --arg url "$URL" \
+                   '{embeds:[{title:$title, description:$desc, url:$url}]}')" \
+              -w "\nHTTP %{http_code}\n" "$WEBHOOK"
           }
-
           send_text() {
-            curl -s -H "Content-Type: application/json" \
-              -d "$(jq -n \
-                  --arg t "$TAG" --arg d "$DATE" \
-                  '{content: ("변경 없음 ✅ 현재 최신 릴리스: **" + $t + "** (" + $d + ")") }')" \
-              "$WEBHOOK" > /dev/null
+            curl -sS -H "Content-Type: application/json" \
+              -d "$(jq -n --arg t "$TAG" --arg d "$DATE" \
+                   '{content: ("변경 없음 ✅ 현재 최신 릴리스: **" + $t + "** (" + $d + ")")}')" \
+              -w "\nHTTP %{http_code}\n" "$WEBHOOK"
           }
-
           if [ "$MODE" = "manual" ]; then
             if [ "$CHG" = "true" ]; then send_embed; else send_text; fi
           else
             if [ "$CHG" = "true" ]; then send_embed; fi
           fi
 
+      # ── 최신 버전 기록 업데이트
       - name: Update previous tag file (when changed)
         if: steps.decide.outputs.changed == 'true'
         run: |
