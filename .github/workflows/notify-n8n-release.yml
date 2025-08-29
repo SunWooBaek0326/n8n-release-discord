@@ -2,66 +2,107 @@ name: Notify n8n Releases to Discord
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # 30분마다(UTC). 실제 실행은 지연될 수 있음
-  workflow_dispatch:          # 수동 실행(테스트용)
+    - cron: "*/30 * * * *"     # 30분마다 자동 실행(UTC)
+  workflow_dispatch: {}        # ✅ 수동 실행 버튼
 
 permissions:
-  contents: read
+  contents: write              # 버전 기록 파일 커밋용
 
 jobs:
   notify:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
       - name: Install jq
         run: |
-          sudo apt-get update
+          sudo apt-get update -y
           sudo apt-get install -y jq
 
-      # --- 수동 실행 시, 즉시 웹훅 연결 테스트(시크릿/권한/네트워크 점검) ---
-      - name: Send TEST ping on manual run
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: |
-          jq -n --arg c "✅ GitHub Actions ↔ Discord Webhook 테스트 성공 (manual run)" '{content:$c}' \
-          | curl -s -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK"
-
-      # --- n8n 최신 정식 릴리스 조회 ---
       - name: Fetch latest n8n release
         id: latest
         run: |
-          curl -s https://api.github.com/repos/n8n-io/n8n/releases/latest > latest.json
-          echo "tag=$(jq -r .tag_name latest.json)" >> $GITHUB_OUTPUT
-          echo "url=$(jq -r .html_url latest.json)" >> $GITHUB_OUTPUT
-          # 본문 1,800자 제한 + 안전한 JSON 인코딩 준비
-          body=$(jq -r .body latest.json | head -c 1800)
-          printf '%s' "$body" | jq -Rs '.' > body.json
+          RES=$(curl -s https://api.github.com/repos/n8n-io/n8n/releases/latest)
+          TAG=$(echo "$RES"  | jq -r .tag_name)         # ex) 1.108.2
+          DATE=$(echo "$RES" | jq -r .published_at | cut -dT -f1)
+          URL=$(echo "$RES"  | jq -r .html_url)
+          echo "tag=$TAG"   >> $GITHUB_OUTPUT
+          echo "date=$DATE" >> $GITHUB_OUTPUT
+          echo "url=$URL"   >> $GITHUB_OUTPUT
 
-      # --- 같은 태그는 한 번만 전송하도록 캐시로 중복 방지 ---
-      - name: Cache by release tag
-        id: cache
-        uses: actions/cache@v4
-        with:
-          path: .cache/n8n/${{ steps.latest.outputs.tag }}
-          key: n8n-${{ steps.latest.outputs.tag }}
-
-      # --- 새 태그일 때만 디스코드 알림 전송 ---
-      - name: Send Discord notification (new tag only)
-        if: ${{ steps.cache.outputs.cache-hit != 'true' }}
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      - name: Read previous tag from repo
+        id: prev
         run: |
-          title="n8n ${{ steps.latest.outputs.tag }} released"
-          url="${{ steps.latest.outputs.url }}"
-          desc=$(cat body.json)  # 이미 JSON 문자열로 인코딩됨
+          FILE=".github/n8n_latest"
+          if [ -f "$FILE" ]; then
+            PREV=$(cat "$FILE")
+          else
+            PREV=""
+          fi
+          echo "prev=$PREV" >> $GITHUB_OUTPUT
 
-          jq -n \
-            --arg t "$title" \
-            --arg u "$url" \
-            --argjson d "$desc" \
-            '{username:"n8n Release Bot", embeds:[{title:$t, url:$u, description:$d}]}' \
-          | curl -s -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK"
+      - name: Decide message mode
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}     # schedule | workflow_dispatch
+          PREV:  ${{ steps.prev.outputs.prev }}
+          CURR:  ${{ steps.latest.outputs.tag }}
+        run: |
+          CHANGED="false"
+          if [ "$PREV" != "$CURR" ]; then CHANGED="true"; fi
 
-          # 캐시 시드(같은 태그 재전송 방지)
-          mkdir -p ".cache/n8n/${{ steps.latest.outputs.tag }}"
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            MODE="manual"         # 수동 실행
+          else
+            MODE="auto"           # 자동 실행
+          fi
+
+          echo "changed=$CHANGED" >> $GITHUB_OUTPUT
+          echo "mode=$MODE"       >> $GITHUB_OUTPUT
+
+      - name: Send to Discord
+        if: always()
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TAG:  ${{ steps.latest.outputs.tag }}
+          DATE: ${{ steps.latest.outputs.date }}
+          URL:  ${{ steps.latest.outputs.url }}
+          MODE: ${{ steps.decide.outputs.mode }}
+          CHG:  ${{ steps.decide.outputs.changed }}
+        run: |
+          send_embed() {
+            curl -s -H "Content-Type: application/json" \
+              -d "$(jq -n \
+                  --arg title "n8n @$TAG released" \
+                  --arg desc  "$DATE" \
+                  --arg url   "$URL" \
+                  '{embeds:[{title:$title, description:$desc, url:$url}]}')" \
+              "$WEBHOOK" > /dev/null
+          }
+
+          send_text() {
+            curl -s -H "Content-Type: application/json" \
+              -d "$(jq -n \
+                  --arg t "$TAG" --arg d "$DATE" \
+                  '{content: ("변경 없음 ✅ 현재 최신 릴리스: **" + $t + "** (" + $d + ")") }')" \
+              "$WEBHOOK" > /dev/null
+          }
+
+          if [ "$MODE" = "manual" ]; then
+            if [ "$CHG" = "true" ]; then send_embed; else send_text; fi
+          else
+            if [ "$CHG" = "true" ]; then send_embed; fi
+          fi
+
+      - name: Update previous tag file (when changed)
+        if: steps.decide.outputs.changed == 'true'
+        run: |
+          mkdir -p .github
+          echo "${{ steps.latest.outputs.tag }}" > .github/n8n_latest
+          git config user.name  "actions-bot"
+          git config user.email "actions-bot@users.noreply.github.com"
+          git add .github/n8n_latest
+          git commit -m "chore: update latest n8n tag to ${{ steps.latest.outputs.tag }}"
+          git push
