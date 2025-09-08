@@ -38,15 +38,14 @@ jobs:
       - name: Normalize webhook value
         id: hook
         run: |
-          CLEAN=$(printf "%s" "${{ secrets.DISCORD_WEBHOOK_URL }}" \
-                  | tr -d '\r' | tr -d '\n' | xargs)
+          CLEAN=$(printf "%s" "${{ secrets.DISCORD_WEBHOOK_URL }}" | tr -d '\r' | tr -d '\n' | xargs)
           case "$CLEAN" in
             https://discord.com/api/webhooks/*|https://discordapp.com/api/webhooks/*) : ;;
             *) echo "::error::Webhook URL looks invalid: $CLEAN"; exit 2 ;;
           esac
-          echo "webhook=$CLEAN" >> $GITHUB_OUTPUT
+          echo "webhook=$CLEAN" >> "$GITHUB_OUTPUT"
 
-      # 2) 이벤트 유형별 릴리즈 정보 준비
+      # 2) 이벤트 유형별 릴리즈 정보 준비 (멀티라인 출력은 heredoc 사용)
       - name: Prepare release payload
         id: rel
         env:
@@ -67,14 +66,22 @@ jobs:
             DATE=$(echo "$RES"  | jq -r .published_at)
             BODY_RAW=$(echo "$RES" | jq -r .body)
           fi
-          DATE_SHORT=$(echo "$DATE" | cut -dT -f1)
-          BODY_TRIM=$(printf "%s" "$BODY_RAW" | head -c 1800)
 
-          echo "tag=$TAG"         >> $GITHUB_OUTPUT
-          echo "title=$TITLE"     >> $GITHUB_OUTPUT
-          echo "url=$URL"         >> $GITHUB_OUTPUT
-          echo "date=$DATE_SHORT" >> $GITHUB_OUTPUT
-          echo "body=$BODY_TRIM"  >> $GITHUB_OUTPUT
+          # 기본값/정리
+          [ -z "$TITLE" -o "$TITLE" = "null" ] && TITLE="n8n @$TAG"
+          DATE_SHORT=$(echo "$DATE" | cut -dT -f1)
+          BODY_TRIM=$(printf "%s" "$BODY_RAW" | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g' | head -c 1800)
+          [ "$BODY_TRIM" = "null" ] && BODY_TRIM=""
+
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "title=$TITLE"     >> "$GITHUB_OUTPUT"
+          echo "url=$URL"         >> "$GITHUB_OUTPUT"
+          echo "date=$DATE_SHORT" >> "$GITHUB_OUTPUT"
+          {
+            echo "body<<__REL_BODY__"
+            printf '%s\n' "$BODY_TRIM"
+            echo "__REL_BODY__"
+          } >> "$GITHUB_OUTPUT"
 
       # 3) 이전에 보낸 태그 읽기 (폴링/수동 시 중복 방지)
       - name: Read previous tag
@@ -82,7 +89,7 @@ jobs:
         run: |
           FILE=".github/n8n_latest"
           if [ -f "$FILE" ]; then PREV=$(cat "$FILE"); else PREV=""; fi
-          echo "prev=$PREV" >> $GITHUB_OUTPUT
+          echo "prev=$PREV" >> "$GITHUB_OUTPUT"
 
       # 4) 전송 모드/중복 여부 결정
       - name: Decide sending mode
@@ -93,16 +100,14 @@ jobs:
           CURR:  ${{ steps.rel.outputs.tag }}
         run: |
           if [ "$EVENT" = "release" ]; then
-            echo "mode=push" >> $GITHUB_OUTPUT
-            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "mode=push" >> "$GITHUB_OUTPUT"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          CHANGED="false"
-          [ "$PREV" != "$CURR" ] && CHANGED="true"
-          MODE="auto"
-          [ "$EVENT" = "workflow_dispatch" ] && MODE="manual"
-          echo "mode=$MODE"       >> $GITHUB_OUTPUT
-          echo "changed=$CHANGED" >> $GITHUB_OUTPUT
+          CHANGED="false"; [ "$PREV" != "$CURR" ] && CHANGED="true"
+          MODE="auto"; [ "$EVENT" = "workflow_dispatch" ] && MODE="manual"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
 
       # 5) Discord 전송
       - name: Send to Discord
