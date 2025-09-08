@@ -21,7 +21,7 @@ jobs:
       - name: Install jq
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq
+          sudo apt-get install -y jq curl
 
       # 0) Webhook 시크릿 확인
       - name: Validate webhook secret
@@ -79,7 +79,18 @@ jobs:
             echo "__REL_BODY__"
           } >> "$GITHUB_OUTPUT"
 
-      # 3) 이전에 보낸 태그 읽기 (폴링/자동 시 중복 방지용)
+      # 3) npm dist-tags 조회 (latest, next)
+      - name: Fetch npm dist-tags
+        id: dist
+        run: |
+          # registry API에서 dist-tags(JSON) 가져오기
+          JSON=$(curl -s https://registry.npmjs.org/-/package/n8n/dist-tags)
+          LATEST=$(echo "$JSON" | jq -r .latest)
+          NEXT=$(echo "$JSON"   | jq -r .next)
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "next=$NEXT"     >> "$GITHUB_OUTPUT"
+
+      # 4) 이전에 보낸 태그 읽기 (폴링/자동 시 중복 방지용)
       - name: Read previous tag
         id: prev
         run: |
@@ -87,14 +98,23 @@ jobs:
           if [ -f "$FILE" ]; then PREV=$(cat "$FILE"); else PREV=""; fi
           echo "prev=$PREV" >> "$GITHUB_OUTPUT"
 
-      # 4) 모드/중복 여부 결정
-      - name: Decide sending mode
+      # 5) 모드/중복 여부 및 채널 판단
+      - name: Decide sending mode & channel
         id: decide
         env:
-          EVENT: ${{ github.event_name }}
-          PREV:  ${{ steps.prev.outputs.prev }}
-          CURR:  ${{ steps.rel.outputs.tag }}
+          EVENT:  ${{ github.event_name }}
+          PREV:   ${{ steps.prev.outputs.prev }}
+          CURR:   ${{ steps.rel.outputs.tag }}
+          LATEST: ${{ steps.dist.outputs.latest }}
+          NEXT:   ${{ steps.dist.outputs.next }}
         run: |
+          # 채널 라벨 계산
+          CHANNEL="(untracked)"
+          if [ "$CURR" = "$LATEST" ]; then CHANNEL="latest"
+          elif [ "$CURR" = "$NEXT" ]; then CHANNEL="next"
+          fi
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+
           # release: 무조건 전송 + 기록 갱신
           if [ "$EVENT" = "release" ]; then
             echo "mode=push"     >> "$GITHUB_OUTPUT"
@@ -121,7 +141,7 @@ jobs:
             echo "update_tag=0"   >> "$GITHUB_OUTPUT"
           fi
 
-      # 5) Discord 전송 (수동/릴리즈는 항상, 폴링은 변경 시만)
+      # 6) Discord 전송 (수동/릴리즈는 항상, 폴링은 변경 시만)
       - name: Send to Discord
         if: steps.decide.outputs.changed == 'true'
         env:
@@ -131,18 +151,35 @@ jobs:
           URL:     ${{ steps.rel.outputs.url }}
           DATE:    ${{ steps.rel.outputs.date }}
           BODY:    ${{ steps.rel.outputs.body }}
+          LATEST:  ${{ steps.dist.outputs.latest }}
+          NEXT:    ${{ steps.dist.outputs.next }}
+          CHANNEL: ${{ steps.decide.outputs.channel }}
         run: |
           set -e
-          # printf로 개행을 명시적으로 넣어 Discord에서 줄바꿈이 정확히 보이게 함
           DESC=$(printf "**%s** released on %s\n\n%s" "$TAG" "$DATE" "$BODY")
           jq -n \
-            --arg title "$TITLE" \
-            --arg url   "$URL" \
-            --arg desc  "$DESC" \
-            '{embeds:[{title:$title, url:$url, description:$desc}]}' \
+            --arg title   "$TITLE" \
+            --arg url     "$URL" \
+            --arg desc    "$DESC" \
+            --arg latest  "$LATEST" \
+            --arg next    "$NEXT" \
+            --arg channel "$CHANNEL" \
+            '{
+              embeds:[
+                {
+                  title:$title,
+                  url:$url,
+                  description:$desc,
+                  fields:[
+                    {name:"Channels", value:("latest: " + $latest + " • next: " + $next), inline:true},
+                    {name:"This release channel", value:$channel, inline:true}
+                  ]
+                }
+              ]
+            }' \
           | curl -sS -H "Content-Type: application/json" -d @- "$WEBHOOK" -w "\nHTTP %{http_code}\n"
 
-      # 6) 기록 파일 갱신 (수동은 갱신 안 함, push 실패는 무시)
+      # 7) 기록 파일 갱신 (수동은 갱신 안 함, push 실패는 무시)
       - name: Update last sent tag (tolerant push)
         if: steps.decide.outputs.update_tag == '1'
         run: |
