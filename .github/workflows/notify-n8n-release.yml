@@ -42,7 +42,7 @@ jobs:
           esac
           echo "webhook=$CLEAN" >> "$GITHUB_OUTPUT"
 
-      # 2) 이벤트 유형별 릴리즈 정보 준비 (멀티라인은 heredoc)
+      # 2) 이벤트 유형별 릴리즈 정보 준비 (멀티라인은 heredoc으로 출력)
       - name: Prepare release payload
         id: rel
         env:
@@ -95,7 +95,7 @@ jobs:
           PREV:  ${{ steps.prev.outputs.prev }}
           CURR:  ${{ steps.rel.outputs.tag }}
         run: |
-          # release: 무조건 전송
+          # release: 무조건 전송 + 기록 갱신
           if [ "$EVENT" = "release" ]; then
             echo "mode=push"     >> "$GITHUB_OUTPUT"
             echo "changed=true"  >> "$GITHUB_OUTPUT"
@@ -103,7 +103,7 @@ jobs:
             exit 0
           fi
 
-          # workflow_dispatch(수동): 무조건 전송(기록파일은 갱신하지 않음)
+          # workflow_dispatch(수동): 무조건 전송(기록 갱신하지 않음)
           if [ "$EVENT" = "workflow_dispatch" ]; then
             echo "mode=manual"   >> "$GITHUB_OUTPUT"
             echo "changed=true"  >> "$GITHUB_OUTPUT"
@@ -113,12 +113,12 @@ jobs:
 
           # schedule(폴링): 새 태그일 때만 전송 + 기록 갱신
           CHANGED="false"; [ "$PREV" != "$CURR" ] && CHANGED="true"
-          echo "mode=auto"               >> "$GITHUB_OUTPUT"
-          echo "changed=$CHANGED"        >> "$GITHUB_OUTPUT"
+          echo "mode=auto"        >> "$GITHUB_OUTPUT"
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
           if [ "$CHANGED" = "true" ]; then
-            echo "update_tag=1"          >> "$GITHUB_OUTPUT"
+            echo "update_tag=1"   >> "$GITHUB_OUTPUT"
           else
-            echo "update_tag=0"          >> "$GITHUB_OUTPUT"
+            echo "update_tag=0"   >> "$GITHUB_OUTPUT"
           fi
 
       # 5) Discord 전송 (수동/릴리즈는 항상, 폴링은 변경 시만)
@@ -133,10 +133,12 @@ jobs:
           BODY:    ${{ steps.rel.outputs.body }}
         run: |
           set -e
+          # printf로 개행을 명시적으로 넣어 Discord에서 줄바꿈이 정확히 보이게 함
+          DESC=$(printf "**%s** released on %s\n\n%s" "$TAG" "$DATE" "$BODY")
           jq -n \
             --arg title "$TITLE" \
             --arg url   "$URL" \
-            --arg desc  "**$TAG** released on $DATE\n\n$BODY" \
+            --arg desc  "$DESC" \
             '{embeds:[{title:$title, url:$url, description:$desc}]}' \
           | curl -sS -H "Content-Type: application/json" -d @- "$WEBHOOK" -w "\nHTTP %{http_code}\n"
 
