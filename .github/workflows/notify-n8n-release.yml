@@ -1,12 +1,17 @@
 name: Notify n8n Releases to Discord
 
 on:
+  # 🔔 릴리즈가 'published' 되는 즉시 트리거 (실시간)
+  release:
+    types: [published]
+  # ⏱ 폴링(백업용): 30분마다 확인 (UTC 기준) — 실시간 누락 대비
   schedule:
-    - cron: "*/30 * * * *"     # 30분마다 자동 실행(UTC)
-  workflow_dispatch: {}        # 수동 실행 버튼
+    - cron: "*/30 * * * *"
+  # ▶️ 수동 실행 버튼
+  workflow_dispatch: {}
 
 permissions:
-  contents: write              # .github/n8n_latest 커밋용
+  contents: write   # .github/n8n_latest 커밋용 (중복 방지 기록)
 
 jobs:
   notify:
@@ -21,7 +26,7 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq
 
-      # 1) 시크릿 유무 확인
+      # 0) Webhook 시크릿 확인
       - name: Validate webhook secret
         run: |
           if [ -z "${{ secrets.DISCORD_WEBHOOK_URL }}" ]; then
@@ -29,7 +34,7 @@ jobs:
             exit 1
           fi
 
-      # 2) 시크릿 정규화(공백/줄바꿈 제거) + 형식 점검
+      # 1) Webhook 값 정규화 + 형식 점검
       - name: Normalize webhook value
         id: hook
         run: |
@@ -41,90 +46,105 @@ jobs:
           esac
           echo "webhook=$CLEAN" >> $GITHUB_OUTPUT
 
-      # 3) 최신 n8n 릴리스 조회
-      - name: Fetch latest n8n release
-        id: latest
+      # 2) 이벤트 유형별로 릴리즈 정보 준비
+      #    - release 이벤트: GitHub 이벤트 페이로드에서 직접 읽음(실시간)
+      #    - schedule/workflow_dispatch: API에서 최신 릴리즈 조회(폴링/수동)
+      - name: Prepare release payload
+        id: rel
+        env:
+          EVENT: ${{ github.event_name }}
         run: |
-          RES=$(curl -s https://api.github.com/repos/n8n-io/n8n/releases/latest)
-          TAG=$(echo "$RES"  | jq -r .tag_name)           # 예: 1.108.2
-          DATE=$(echo "$RES" | jq -r .published_at | cut -dT -f1)
-          URL=$(echo "$RES"  | jq -r .html_url)
-          echo "tag=$TAG"   >> $GITHUB_OUTPUT
-          echo "date=$DATE" >> $GITHUB_OUTPUT
-          echo "url=$URL"   >> $GITHUB_OUTPUT
+          set -e
 
-      # 4) 이전 전송 태그 읽기
-      - name: Read previous tag from repo
+          if [ "$EVENT" = "release" ]; then
+            # 실시간: 이벤트 페이로드 사용
+            TAG='${{ github.event.release.tag_name }}'
+            TITLE='${{ github.event.release.name }}'
+            URL='${{ github.event.release.html_url }}'
+            DATE='${{ github.event.release.published_at }}'
+            BODY_RAW='${{ github.event.release.body }}'
+          else
+            # 폴링/수동: API 조회
+            RES=$(curl -s https://api.github.com/repos/n8n-io/n8n/releases/latest)
+            TAG=$(echo "$RES"   | jq -r .tag_name)
+            TITLE=$(echo "$RES" | jq -r .name)
+            URL=$(echo "$RES"   | jq -r .html_url)
+            DATE=$(echo "$RES"  | jq -r .published_at)
+            BODY_RAW=$(echo "$RES" | jq -r .body)
+          fi
+
+          # 날짜 YYYY-MM-DD 로 간단 표기
+          DATE_SHORT=$(echo "$DATE" | cut -dT -f1)
+
+          # Discord 임베드 제한 대비(설명 1800자 이내로 트림)
+          BODY_TRIM=$(printf "%s" "$BODY_RAW" | head -c 1800)
+
+          echo "tag=$TAG"         >> $GITHUB_OUTPUT
+          echo "title=$TITLE"     >> $GITHUB_OUTPUT
+          echo "url=$URL"         >> $GITHUB_OUTPUT
+          echo "date=$DATE_SHORT" >> $GITHUB_OUTPUT
+          echo "body=$BODY_TRIM"  >> $GITHUB_OUTPUT
+
+      # 3) 이전에 보낸 태그 읽기(폴링/수동일 때만 중복 방지에 사용)
+      - name: Read previous tag
         id: prev
         run: |
           FILE=".github/n8n_latest"
           if [ -f "$FILE" ]; then PREV=$(cat "$FILE"); else PREV=""; fi
           echo "prev=$PREV" >> $GITHUB_OUTPUT
 
-      # 5) 실행 모드/변경여부 결정
-      - name: Decide message mode
+      # 4) 전송 모드/중복 여부 결정
+      - name: Decide sending mode
         id: decide
         env:
-          EVENT: ${{ github.event_name }}           # schedule | workflow_dispatch
+          EVENT: ${{ github.event_name }}
           PREV:  ${{ steps.prev.outputs.prev }}
-          CURR:  ${{ steps.latest.outputs.tag }}
+          CURR:  ${{ steps.rel.outputs.tag }}
         run: |
-          CHANGED="false"
-          if [ "$PREV" != "$CURR" ]; then CHANGED="true"; fi
-          MODE="auto"
-          if [ "$EVENT" = "workflow_dispatch" ]; then MODE="manual"; fi
-          echo "changed=$CHANGED" >> $GITHUB_OUTPUT
-          echo "mode=$MODE"       >> $GITHUB_OUTPUT
-
-      # 6) Discord 전송(중복 방지 확정 분기)
-      - name: Send to Discord
-        if: always()
-        env:
-          WEBHOOK: ${{ steps.hook.outputs.webhook }}
-          TAG:  ${{ steps.latest.outputs.tag }}
-          DATE: ${{ steps.latest.outputs.date }}
-          URL:  ${{ steps.latest.outputs.url }}
-          MODE: ${{ steps.decide.outputs.mode }}
-          CHG:  ${{ steps.decide.outputs.changed }}
-        run: |
-          set -e
-
-          send_embed() {
-            curl -sS -H "Content-Type: application/json" \
-              -d "$(jq -n --arg title "n8n @$TAG released" --arg desc "$DATE" --arg url "$URL" \
-                   '{embeds:[{title:$title, description:$desc, url:$url}]}')" \
-              -w "\nHTTP %{http_code}\n" "$WEBHOOK"
-          }
-
-          send_text() {
-            curl -sS -H "Content-Type: application/json" \
-              -d "$(jq -n --arg t "$TAG" --arg d "$DATE" \
-                   '{content: ("변경 없음 ✅ 현재 최신 릴리스: **" + $t + "** (" + $d + ")")}')" \
-              -w "\nHTTP %{http_code}\n" "$WEBHOOK"
-          }
-
-          if [ "$MODE" = "manual" ]; then
-            # 수동 실행: 새 버전이면 embed, 아니면 텍스트(항상 1회 전송)
-            if [ "$CHG" = "true" ]; then
-              send_embed
-            else
-              send_text
-            fi
-          else
-            # 자동 실행: 새 버전일 때만 전송(항상 1회 전송)
-            if [ "$CHG" = "true" ]; then
-              send_embed
-            fi
+          # release 이벤트는 무조건 전송(실시간)
+          if [ "$EVENT" = "release" ]; then
+            echo "mode=push" >> $GITHUB_OUTPUT
+            echo "changed=true" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
-      # 7) 새 버전이면 기록 파일 갱신
-      - name: Update previous tag file (when changed)
+          # 폴링/수동: 새 태그일 때만 전송
+          CHANGED="false"
+          [ "$PREV" != "$CURR" ] && CHANGED="true"
+
+          MODE="auto"
+          [ "$EVENT" = "workflow_dispatch" ] && MODE="manual"
+
+          echo "mode=$MODE"     >> $GITHUB_OUTPUT
+          echo "changed=$CHANGED" >> $GITHUB_OUTPUT
+
+      # 5) Discord 전송
+      - name: Send to Discord
+        if: steps.decide.outputs.changed == 'true'
+        env:
+          WEBHOOK: ${{ steps.hook.outputs.webhook }}
+          TAG:     ${{ steps.rel.outputs.tag }}
+          TITLE:   ${{ steps.rel.outputs.title }}
+          URL:     ${{ steps.rel.outputs.url }}
+          DATE:    ${{ steps.rel.outputs.date }}
+          BODY:    ${{ steps.rel.outputs.body }}
+        run: |
+          set -e
+          jq -n \
+            --arg title "$TITLE" \
+            --arg url   "$URL" \
+            --arg desc  "**$TAG** released on $DATE\n\n$BODY" \
+            '{embeds:[{title:$title, url:$url, description:$desc}]}' \
+          | curl -sS -H "Content-Type: application/json" -d @- "$WEBHOOK" -w "\nHTTP %{http_code}\n"
+
+      # 6) 기록 파일 갱신(보낸 태그 저장)
+      - name: Update last sent tag
         if: steps.decide.outputs.changed == 'true'
         run: |
           mkdir -p .github
-          echo "${{ steps.latest.outputs.tag }}" > .github/n8n_latest
+          echo "${{ steps.rel.outputs.tag }}" > .github/n8n_latest
           git config user.name  "actions-bot"
           git config user.email "actions-bot@users.noreply.github.com"
           git add .github/n8n_latest
-          git commit -m "chore: update latest n8n tag to ${{ steps.latest.outputs.tag }}"
-          git push
+          git commit -m "chore: update latest n8n tag to ${{ steps.rel.outputs.tag }}" || echo "nothing to commit"
+          git push || echo "no changes pushed"
