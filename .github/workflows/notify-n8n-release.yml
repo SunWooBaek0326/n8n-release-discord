@@ -1,17 +1,14 @@
 name: Notify n8n Releases to Discord
 
 on:
-  # 실시간: 릴리즈가 'published' 되면 즉시 트리거
   release:
-    types: [published]
-  # 백업: 30분마다 최신 릴리즈 폴링 (UTC)
+    types: [published]        # 실시간: 릴리즈 공개 즉시
   schedule:
-    - cron: "*/30 * * * *"
-  # 수동 실행
-  workflow_dispatch: {}
+    - cron: "*/30 * * * *"    # 백업: 30분 폴링
+  workflow_dispatch: {}       # 수동 실행(테스트용, 항상 전송)
 
 permissions:
-  contents: write   # .github/n8n_latest 기록 파일 커밋용
+  contents: write             # .github/n8n_latest 커밋용
 
 jobs:
   notify:
@@ -45,7 +42,7 @@ jobs:
           esac
           echo "webhook=$CLEAN" >> "$GITHUB_OUTPUT"
 
-      # 2) 이벤트 유형별 릴리즈 정보 준비 (멀티라인 출력은 heredoc 사용)
+      # 2) 이벤트 유형별 릴리즈 정보 준비 (멀티라인은 heredoc)
       - name: Prepare release payload
         id: rel
         env:
@@ -67,7 +64,6 @@ jobs:
             BODY_RAW=$(echo "$RES" | jq -r .body)
           fi
 
-          # 기본값/정리
           [ -z "$TITLE" -o "$TITLE" = "null" ] && TITLE="n8n @$TAG"
           DATE_SHORT=$(echo "$DATE" | cut -dT -f1)
           BODY_TRIM=$(printf "%s" "$BODY_RAW" | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g' | head -c 1800)
@@ -83,7 +79,7 @@ jobs:
             echo "__REL_BODY__"
           } >> "$GITHUB_OUTPUT"
 
-      # 3) 이전에 보낸 태그 읽기 (폴링/수동 시 중복 방지)
+      # 3) 이전에 보낸 태그 읽기 (폴링/자동 시 중복 방지용)
       - name: Read previous tag
         id: prev
         run: |
@@ -91,7 +87,7 @@ jobs:
           if [ -f "$FILE" ]; then PREV=$(cat "$FILE"); else PREV=""; fi
           echo "prev=$PREV" >> "$GITHUB_OUTPUT"
 
-      # 4) 전송 모드/중복 여부 결정
+      # 4) 모드/중복 여부 결정
       - name: Decide sending mode
         id: decide
         env:
@@ -99,17 +95,33 @@ jobs:
           PREV:  ${{ steps.prev.outputs.prev }}
           CURR:  ${{ steps.rel.outputs.tag }}
         run: |
+          # release: 무조건 전송
           if [ "$EVENT" = "release" ]; then
-            echo "mode=push" >> "$GITHUB_OUTPUT"
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "mode=push"     >> "$GITHUB_OUTPUT"
+            echo "changed=true"  >> "$GITHUB_OUTPUT"
+            echo "update_tag=1"  >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          CHANGED="false"; [ "$PREV" != "$CURR" ] && CHANGED="true"
-          MODE="auto"; [ "$EVENT" = "workflow_dispatch" ] && MODE="manual"
-          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
 
-      # 5) Discord 전송
+          # workflow_dispatch(수동): 무조건 전송(기록파일은 갱신하지 않음)
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "mode=manual"   >> "$GITHUB_OUTPUT"
+            echo "changed=true"  >> "$GITHUB_OUTPUT"
+            echo "update_tag=0"  >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # schedule(폴링): 새 태그일 때만 전송 + 기록 갱신
+          CHANGED="false"; [ "$PREV" != "$CURR" ] && CHANGED="true"
+          echo "mode=auto"               >> "$GITHUB_OUTPUT"
+          echo "changed=$CHANGED"        >> "$GITHUB_OUTPUT"
+          if [ "$CHANGED" = "true" ]; then
+            echo "update_tag=1"          >> "$GITHUB_OUTPUT"
+          else
+            echo "update_tag=0"          >> "$GITHUB_OUTPUT"
+          fi
+
+      # 5) Discord 전송 (수동/릴리즈는 항상, 폴링은 변경 시만)
       - name: Send to Discord
         if: steps.decide.outputs.changed == 'true'
         env:
@@ -128,9 +140,9 @@ jobs:
             '{embeds:[{title:$title, url:$url, description:$desc}]}' \
           | curl -sS -H "Content-Type: application/json" -d @- "$WEBHOOK" -w "\nHTTP %{http_code}\n"
 
-      # 6) 기록 파일 갱신 (push 실패는 성공 처리로 무시)
+      # 6) 기록 파일 갱신 (수동은 갱신 안 함, push 실패는 무시)
       - name: Update last sent tag (tolerant push)
-        if: steps.decide.outputs.changed == 'true'
+        if: steps.decide.outputs.update_tag == '1'
         run: |
           mkdir -p .github
           echo "${{ steps.rel.outputs.tag }}" > .github/n8n_latest
