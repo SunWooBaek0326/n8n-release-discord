@@ -104,4 +104,102 @@ jobs:
           EVENT:  ${{ github.event_name }}
           PREV:   ${{ steps.prev.outputs.prev }}
           CURR:   ${{ steps.rel.outputs.tag }}         # 예: n8n@1.110.1
-          LATEST: ${{ steps.dist.outputs.latest }}      # 예: 1.
+          LATEST: ${{ steps.dist.outputs.latest }}      # 예: 1.110.1
+          NEXT:   ${{ steps.dist.outputs.next }}        # 예: 1.111.0
+        run: |
+          # 태그 정규화: 접두어 n8n@ 또는 v 제거
+          RAW="$CURR"
+          CURR_VER=$(echo "$RAW" | sed -E 's/^(n8n@|v)//')
+
+          CHANNEL="(untracked)"
+          COLOR_DEC=10070709   # 회색(0x99AAB5)
+          if [ "$CURR_VER" = "$LATEST" ]; then
+            CHANNEL="latest"
+            COLOR_DEC=5763719  # 초록(0x57F287)
+          elif [ "$CURR_VER" = "$NEXT" ]; then
+            CHANNEL="next"
+            COLOR_DEC=10181046 # 보라(0x9B59B6)
+          fi
+
+          echo "channel=$CHANNEL"  >> "$GITHUB_OUTPUT"
+          echo "color=$COLOR_DEC"  >> "$GITHUB_OUTPUT"
+
+          # release: 무조건 전송 + 기록 갱신
+          if [ "$EVENT" = "release" ]; then
+            echo "mode=push"     >> "$GITHUB_OUTPUT"
+            echo "changed=true"  >> "$GITHUB_OUTPUT"
+            echo "update_tag=1"  >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # workflow_dispatch(수동): 무조건 전송(기록 갱신하지 않음)
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "mode=manual"   >> "$GITHUB_OUTPUT"
+            echo "changed=true"  >> "$GITHUB_OUTPUT"
+            echo "update_tag=0"  >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # schedule(폴링): 새 태그일 때만 전송 + 기록 갱신
+          CHANGED="false"; [ "$PREV" != "$CURR" ] && CHANGED="true"
+          echo "mode=auto"        >> "$GITHUB_OUTPUT"
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          if [ "$CHANGED" = "true" ]; then
+            echo "update_tag=1"   >> "$GITHUB_OUTPUT"
+          else
+            echo "update_tag=0"   >> "$GITHUB_OUTPUT"
+          fi
+
+      # 6) Discord 전송 (수동/릴리즈는 항상, 폴링은 변경 시만)
+      - name: Send to Discord
+        if: steps.decide.outputs.changed == 'true'
+        env:
+          WEBHOOK: ${{ steps.hook.outputs.webhook }}
+          TAG:     ${{ steps.rel.outputs.tag }}
+          TITLE:   ${{ steps.rel.outputs.title }}
+          URL:     ${{ steps.rel.outputs.url }}
+          DATE:    ${{ steps.rel.outputs.date }}
+          BODY:    ${{ steps.rel.outputs.body }}
+          LATEST:  ${{ steps.dist.outputs.latest }}
+          NEXT:    ${{ steps.dist.outputs.next }}
+          CHANNEL: ${{ steps.decide.outputs.channel }}
+          COLOR:   ${{ steps.decide.outputs.color }}
+        run: |
+          set -e
+          DESC=$(printf "**%s** released on %s\n\n%s" "$TAG" "$DATE" "$BODY")
+          jq -n \
+            --arg title   "$TITLE" \
+            --arg url     "$URL" \
+            --arg desc    "$DESC" \
+            --arg latest  "$LATEST" \
+            --arg next    "$NEXT" \
+            --arg channel "$CHANNEL" \
+            --argjson color "$COLOR" \
+            '{
+              embeds:[
+                {
+                  title:$title,
+                  url:$url,
+                  description:$desc,
+                  color:$color,
+                  fields:[
+                    {name:"Channels", value:("latest: " + $latest + " • next: " + $next), inline:true},
+                    {name:"This release channel", value:$channel, inline:true}
+                  ]
+                }
+              ]
+            }' \
+          | curl -sS -H "Content-Type: application/json" -d @- "$WEBHOOK" -w "\nHTTP %{http_code}\n"
+
+      # 7) 기록 파일 갱신 (수동은 갱신 안 함, push 실패는 무시)
+      - name: Update last sent tag (tolerant push)
+        if: steps.decide.outputs.update_tag == '1'
+        run: |
+          mkdir -p .github
+          echo "${{ steps.rel.outputs.tag }}" > .github/n8n_latest
+          git config user.name  "actions-bot"
+          git config user.email "actions-bot@users.noreply.github.com"
+          git add .github/n8n_latest
+          git commit -m "chore: update latest n8n tag to ${{ steps.rel.outputs.tag }}" || echo "nothing to commit"
+          git pull --rebase || echo "skip rebase"
+          git push || echo "skip push"
