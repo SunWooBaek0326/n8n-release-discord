@@ -50,8 +50,8 @@ jobs:
           fi
 
           DATE_SHORT=$(echo "$DATE" | cut -dT -f1)
-          # HTML 태그 이스케이프 및 본문 요약 (텔레그램 전송용)
-          BODY_SAFE=$(printf "%s" "$BODY_RAW" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' | head -c 1000)
+          # HTML 특수기호 이스케이프 및 텔레그램 가독성용 본문 정리
+          BODY_SAFE=$(printf "%s" "$BODY_RAW" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/### //g; s/## //g; s/\* //g' | head -c 800)
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "url=$URL" >> "$GITHUB_OUTPUT"
@@ -91,7 +91,7 @@ jobs:
           fi
           [ "$EVENT" != "workflow_dispatch" ] && echo "update_tag=1" >> "$GITHUB_OUTPUT" || echo "update_tag=0" >> "$GITHUB_OUTPUT"
 
-      # 5) Telegram 전송 (HTML 모드 사용)
+      # 5) Telegram 전송 (디자인 개선 및 인라인 버튼 추가)
       - name: Send to Telegram
         if: steps.decide.outputs.should_send == 'true'
         env:
@@ -104,16 +104,26 @@ jobs:
           LATEST: ${{ steps.dist.outputs.latest }}
           NEXT: ${{ steps.dist.outputs.next }}
         run: |
-          MSG="🚀 <b>n8n 신규 버전 출시!</b> ($DATE)%0A%0A"
-          MSG="$MSG<b>Version:</b> <a href='$URL'>$TAG</a>%0A"
-          MSG="$MSG<b>Latest:</b> <code>$LATEST</code> | <b>Next:</b> <code>$NEXT</code>%0A%0A"
-          MSG="$MSG<b>주요 변경 사항:</b>%0A<code>$BODY</code>"
+          MSG="📦 <b>n8n New Release</b>%0A"
+          MSG="$MSG━━━━━━━━━━━━━━━━━━%0A"
+          MSG="$MSG🏷 <b>Version:</b> <code>$TAG</code>%0A"
+          MSG="$MSG📅 <b>Released:</b> <code>$DATE</code>%0A"
+          MSG="$MSG━━━━━━━━━━━━━━━━━━%0A%0A"
+          MSG="$MSG📢 <b>Release Notes:</b>%0A"
+          MSG="$MSG<code>$BODY...</code>"
           
+          # 하단 버튼 구성
+          BUTTONS='{"inline_keyboard": [[
+            {"text": "🔗 Release Notes", "url": "'"$URL"'"},
+            {"text": "⭐ GitHub", "url": "https://github.com/n8n-io/n8n"}
+          ]]}'
+
           curl -s -X POST "https://api.telegram.org/bot$TOKEN/sendMessage" \
             -d "chat_id=$CHAT_ID" \
             -d "parse_mode=HTML" \
             -d "text=$MSG" \
-            -d "disable_web_page_preview=false"
+            -d "reply_markup=$BUTTONS" \
+            -d "disable_web_page_preview=true"
 
       # 6) 기록 갱신
       - name: Update last sent tag
